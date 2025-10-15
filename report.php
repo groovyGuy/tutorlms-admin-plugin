@@ -1,0 +1,333 @@
+<?php
+// ----------------------
+// 5. SCHEDULE INACTIVITY CHECK
+// ----------------------
+if (!wp_next_scheduled('sdd_check_student_inactivity')) {
+    wp_schedule_event(time(), 'daily', 'sdd_check_student_inactivity');
+}
+
+add_action('sdd_check_student_inactivity', function() {
+    $students = get_users(['role__in' => ['subscriber','student']]);
+    foreach ($students as $student) {
+        $user_id = $student->ID;
+        $last_login = get_user_meta($user_id, 'last_login', true);
+        // Fallback: use Tutor LMS last activity if available
+        if (function_exists('tutor_utils')) {
+            $activity = tutor_utils()->get_last_activity($user_id);
+            if ($activity) $last_login = max($last_login, strtotime($activity));
+        }
+        if (!$last_login) continue;
+        if (time() - $last_login > 14 * 24 * 60 * 60) { // 2 weeks
+            update_user_meta($user_id, 'status_aluno', 'Parado');
+        } else {
+            update_user_meta($user_id, 'status_aluno', 'Ativo');
+        }
+    }
+});
+
+// Track last login
+add_action('wp_login', function($user_login, $user) {
+    update_user_meta($user->ID, 'last_login', time());
+}, 10, 2);
+
+// ----------------------
+// 4. SET DEFAULT STATUS ON REGISTRATION
+// ----------------------
+add_action('user_register', function($user_id) {
+    update_user_meta($user_id, 'status_aluno', 'Ativo');
+});
+
+/*
+Plugin Name: Student Database Dashboard
+Description: Adds a Database dashboard and student progress views integrated with TutorLMS.
+Version: 0.9.1
+Author: Mike Schmidt / OpenAI
+*/
+
+// ----------------------
+// 1. ADMIN MENU
+// ----------------------
+add_action('admin_menu', 'student_database_admin_menu');
+function student_database_admin_menu() {
+    add_menu_page(
+        'Student Database Dashboard', 
+        'Database', 
+        'manage_options', 
+        'student-database-dashboard', 
+        'student_database_admin_page', 
+        'dashicons-database', 
+        2
+    );
+
+    add_submenu_page(
+        'student-database-dashboard',
+        'Reports',
+        'Reports',
+        'manage_options',
+        'student-database-reports',
+        'student_database_reports_page'
+    );
+}
+
+// ----------------------
+// 2. ENQUEUE SELECT2
+// ----------------------
+add_action('admin_enqueue_scripts', function($hook) {
+    if ($hook === 'toplevel_page_student-database-dashboard') {
+        wp_enqueue_script('select2');
+        wp_enqueue_style('select2');
+        wp_add_inline_script('select2', '
+            jQuery(document).ready(function($) {
+                $("#student_select").select2();
+            });
+        ');
+    }
+});
+
+// ----------------------
+// 3. MAIN ADMIN PAGE
+// ----------------------
+function student_database_admin_page() {
+    $students = get_users(['role__in' => ['subscriber','student']]);
+    $selected_id = $_GET['student_id'] ?? '';
+    $selected_tab = $_GET['tab'] ?? 'progress';
+
+    echo '<div class="wrap"><h1>Student Database Dashboard</h1>';
+
+    // Student Selector
+    echo '<form method="GET" style="margin:20px 0;">';
+    echo '<input type="hidden" name="page" value="student-database-dashboard">';
+    echo '<select name="student_id" id="student_select" style="width:300px;">';
+    echo '<option value="">-- Select a Student --</option>';
+    foreach ($students as $s) {
+        $full_name = trim($s->first_name . ' ' . $s->last_name);
+        if (empty($full_name)) {
+            $full_name = $s->display_name;
+        }
+        // Filter out test/demo profiles
+        $name_lc = strtolower($full_name);
+        if (strpos($name_lc, 'test') !== false || strpos($name_lc, 'demo') !== false || strpos($name_lc, 'sample') !== false || strpos($name_lc, 'teste') !== false) {
+            continue;
+        }
+        echo '<option value="'.$s->ID.'" '.selected($selected_id, $s->ID, false).'>'.$full_name.'</option>';
+    }
+    echo '</select> ';
+    submit_button('View', 'primary', '', false);
+    echo '</form>';
+
+    // Tabs and Student Data
+    if (!empty($selected_id)) {
+        $student_id = intval($selected_id);
+
+        echo '<h2>Student: '.get_the_author_meta('display_name', $student_id).'</h2>';
+
+        // Show Membership Level
+        if (function_exists('pmpro_getMembershipLevelForUser')) {
+            $membership = pmpro_getMembershipLevelForUser($student_id);
+            if ($membership && isset($membership->name) && $membership->name) {
+                echo '<p><strong>Nível de Associação:</strong> ' . esc_html($membership->name) . '</p>';
+            } else {
+                echo '<p><strong>Nível de Associação:</strong> <em>Não definido</em></p>';
+            }
+        } else {
+            echo '<p><strong>Nível de Associação:</strong> <em>Plugin PMPro não ativo</em></p>';
+        }
+
+        // Show Student Status
+        $status_aluno = get_user_meta($student_id, 'status_aluno', true);
+        if (!$status_aluno) $status_aluno = 'Ativo';
+        echo '<p><strong>Status do Aluno:</strong> ' . esc_html($status_aluno) . '</p>';
+
+        // Overall course completion summary
+        $total_courses = 0;
+        $completed_courses = 0;
+        if (function_exists('tutor_utils')) {
+            $courses = tutor_utils()->get_enrolled_courses_by_user($student_id);
+            $enrolled_courses = [];
+            if ($courses && $courses->have_posts()) {
+                foreach ($courses->posts as $course) {
+                    if ($course->post_status !== 'publish') continue;
+                    $enrolled_courses[] = $course;
+                }
+            }
+            $total_courses = count($enrolled_courses);
+            foreach ($enrolled_courses as $course) {
+                if (tutor_utils()->is_completed_course($course->ID, $student_id)) $completed_courses++;
+            }
+        }
+        $percent_complete = ($total_courses > 0) ? round(($completed_courses / $total_courses) * 100) : 0;
+        echo '<div style="margin:10px 0;padding:8px 12px;background:#eaf6ff;border-radius:6px;font-size:16px;">
+            <strong>Progresso Geral:</strong> ' . $completed_courses . '/' . $total_courses . ' (' . $percent_complete . '%)
+        </div>';
+
+        // Tab Navigation
+        $tabs = [
+            'progress' => 'Progresso Acadêmico',
+            'status' => 'Status Acadêmico',
+            'personal' => 'Dados Pessoais',
+        ];
+
+        echo '<h3 class="nav-tab-wrapper">';
+        foreach ($tabs as $slug => $label) {
+            $class = ($selected_tab === $slug) ? 'nav-tab nav-tab-active' : 'nav-tab';
+            $url = admin_url('admin.php?page=student-database-dashboard&student_id='.$student_id.'&tab='.$slug);
+            echo '<a href="'.$url.'" class="'.$class.'">'.$label.'</a>';
+        }
+        echo '</h3>';
+
+        // Load tab content
+        $tab_file = plugin_dir_path(__FILE__) . 'tabs/tab-'.$selected_tab.'.php';
+        if (file_exists($tab_file)) {
+            include $tab_file;
+        } else {
+            echo '<p><em>Tab content not found.</em></p>';
+        }
+    }
+
+    echo '</div>';
+}
+
+// ----------------------
+// 6. REPORTS PAGE
+// ----------------------
+function student_database_reports_page() {
+    ?>
+    <div class="wrap">
+        <h1>Relatórios Acadêmicos</h1>
+
+        <div id="reports-filters" style="margin-bottom:15px;">
+
+            <label><strong>Status do Aluno:</strong></label><br>
+            <label><input type="checkbox" name="status[]" value="Ativo"> Ativo</label><br>
+            <label><input type="checkbox" name="status[]" value="Parada"> Parada</label><br>
+            <label><input type="checkbox" name="status[]" value="Concluído"> Concluído</label><br><br>
+
+            <label for="nivel"><strong>Nível de Associação:</strong></label><br>
+            <select name="nivel" id="nivel">
+                <option value="">Todos</option>
+                <option value="Básico">Básico</option>
+                <option value="Avançado">Avançado</option>
+            </select><br><br>
+
+            <label for="pagamento"><strong>Pagamento:</strong></label><br>
+            <select name="pagamento" id="pagamento">
+                <option value="">Todos</option>
+                <option value="Em dia">Em dia</option>
+                <option value="Atrasado">Atrasado</option>
+            </select><br><br>
+
+            <label for="co_validacao"><strong>Co-validação:</strong></label><br>
+            <select name="co_validacao" id="co_validacao">
+                <option value="">Todos</option>
+                <option value="Sim">Sim</option>
+                <option value="Não">Não</option>
+            </select>
+        </div>
+
+        <div id="reports-results">
+            <p>Selecione os filtros para ver os resultados.</p>
+        </div>
+
+        <script>
+        jQuery(document).ready(function($){
+            function loadReports() {
+                var data = {
+                    action: 'sdd_load_reports',
+                    status: [],
+                    nivel: $('#nivel').val(),
+                    pagamento: $('#pagamento').val(),
+                    co_validacao: $('#co_validacao').val()
+                };
+
+                $('input[name="status[]"]:checked').each(function(){
+                    data.status.push($(this).val());
+                });
+
+                $.post(ajaxurl, data, function(response){
+                    $('#reports-results').html(response);
+                });
+            }
+
+            $('#nivel, #pagamento, #co_validacao').change(loadReports);
+            $('input[name="status[]"]').change(loadReports);
+        });
+        </script>
+    </div>
+    <?php
+}
+
+add_action('wp_ajax_sdd_load_reports', 'sdd_load_reports');
+function sdd_load_reports() {
+    $statuses   = isset($_POST['status']) ? (array) $_POST['status'] : [];
+    $nivel      = isset($_POST['nivel']) ? sanitize_text_field($_POST['nivel']) : '';
+    $pagamento  = isset($_POST['pagamento']) ? sanitize_text_field($_POST['pagamento']) : '';
+    $cov        = isset($_POST['co_validacao']) ? sanitize_text_field($_POST['co_validacao']) : '';
+
+    $students = get_users(['role__in' => ['subscriber','student']]);
+    $total_students = count($students);
+    $rows = [];
+
+    foreach ($students as $student) {
+        $id   = $student->ID;
+        $name = trim($student->first_name . ' ' . $student->last_name);
+        if (!$name) $name = $student->display_name;
+
+        $status   = get_user_meta($id, 'status_aluno', true) ?: 'Ativo';
+        $nivelVal = get_user_meta($id, 'nivel_associacao', true) ?: 'Não definido';
+        $paga     = get_user_meta($id, 'pagamento', true) ?: 'Não informado';
+        $covVal   = get_user_meta($id, 'co_validacao', true) ?: 'Não informado';
+
+        // Tutor progress
+        $total = $done = 0;
+        if (function_exists('tutor_utils')) {
+            $courses = tutor_utils()->get_enrolled_courses_by_user($id);
+            if ($courses && $courses->have_posts()) {
+                $total = count($courses->posts);
+                foreach ($courses->posts as $c) {
+                    if (tutor_utils()->is_completed_course($c->ID, $id)) $done++;
+                }
+            }
+        }
+        $progress = $total > 0 ? round(($done/$total)*100) : 0;
+
+        // Apply filters
+        if ($statuses && !in_array(strtolower($status), array_map('strtolower', $statuses))) continue;
+        if ($nivel && strtolower($nivelVal) !== strtolower($nivel)) continue;
+        if ($pagamento && strtolower($paga) !== strtolower($pagamento)) continue;
+        if ($cov && strtolower($covVal) !== strtolower($cov)) continue;
+
+        $rows[] = [
+            'name'      => $name,
+            'status'    => $status,
+            'nivel'     => $nivelVal,
+            'pagamento' => $paga,
+            'cov'       => $covVal,
+            'progress'  => "$done/$total cursos ($progress%)"
+        ];
+    }
+
+    $filtered_count = count($rows);
+    $percentage = $total_students > 0 ? round(($filtered_count / $total_students) * 100, 2) : 0;
+
+    echo '<p>Total: ' . $filtered_count . '/' . $total_students . ' (' . $percentage . '%)</p>';
+
+    if ($rows) {
+        echo '<table class="widefat fixed striped">';
+        echo '<thead><tr><th>Nome</th><th>Status</th><th>Pagamento</th><th>Co-validação</th><th>Nível</th><th>Progresso</th></tr></thead><tbody>';
+        foreach ($rows as $r) {
+            echo '<tr>';
+            echo '<td>'.esc_html($r['name']).'</td>';
+            echo '<td>'.esc_html($r['status']).'</td>';
+            echo '<td>'.esc_html($r['pagamento']).'</td>';
+            echo '<td>'.esc_html($r['cov']).'</td>';
+            echo '<td>'.esc_html($r['nivel']).'</td>';
+            echo '<td>'.esc_html($r['progress']).'</td>';
+            echo '</tr>';
+        }
+        echo '</tbody></table>';
+    } else {
+        echo '<p>Nenhum resultado encontrado.</p>';
+    }
+
+    wp_die();
+}
